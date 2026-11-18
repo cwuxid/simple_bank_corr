@@ -2,7 +2,7 @@
 """Daily bank equity correlation analysis since 2015 using Yahoo Finance.
 
 Install dependencies:
-    python -m pip install --upgrade yfinance pandas numpy matplotlib
+    python -m pip install --upgrade yfinance pandas numpy matplotlib scipy
 
 Run:
     python bank_correlation_analysis.py
@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 import numpy as np
 import pandas as pd
+from scipy.stats import beta, permutation_test
 import yfinance as yf
 
 # BNY replaced BK on May 21, 2026; Yahoo serves its history under BNY.
@@ -32,6 +33,18 @@ def equal_weight_portfolio_log_returns(log_returns: pd.DataFrame) -> pd.Series:
     return np.log1p(np.expm1(log_returns).mean(axis=1)).rename("Equal-weight portfolio")
 
 
+def pearson_correlation_pvalues(correlations: pd.DataFrame, observations: int) -> pd.DataFrame:
+    """Two-sided tests of zero correlation; every cell must use the same sample size."""
+    pvalues = np.full(correlations.shape, np.nan)
+    if observations == 2:
+        pvalues = np.where(correlations.notna(), 1.0, np.nan)
+    elif observations > 2:
+        # Exact null distribution used by scipy.stats.pearsonr.
+        distribution = beta(observations / 2 - 1, observations / 2 - 1, loc=-1, scale=2)
+        pvalues = 2 * distribution.cdf(-correlations.abs().clip(upper=1))
+    return pd.DataFrame(pvalues, index=correlations.index, columns=correlations.columns)
+
+
 def annual_bank_correlations(log_returns: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     means, medians = {}, {}
     for year, annual_returns in log_returns.groupby(log_returns.index.year):
@@ -43,6 +56,40 @@ def annual_bank_correlations(log_returns: pd.DataFrame) -> tuple[pd.DataFrame, p
     mean_table = pd.DataFrame(means).rename_axis(index="Bank", columns="Year")
     median_table = pd.DataFrame(medians).rename_axis(index="Bank", columns="Year")
     return mean_table, median_table
+
+
+def annual_summary_correlation_pvalues(
+    log_returns: pd.DataFrame, n_resamples: int = 9999, seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Test each bank's mean/median correlation by permuting its days against fixed peers."""
+    years = sorted(log_returns.index.year.unique())
+    means = pd.DataFrame(np.nan, index=log_returns.columns, columns=years)
+    medians = means.copy()
+    rng = np.random.default_rng(seed)
+    for year, sample in log_returns.groupby(log_returns.index.year):
+        values = sample.to_numpy(dtype=float)
+        if len(sample) < 3 or len(sample.columns) < 2 or not np.isfinite(values).all():
+            continue
+        centered = values - values.mean(axis=0)
+        norms = np.linalg.norm(centered, axis=0)
+        # A constant bank makes every bank's nine-peer summary undefined.
+        if (norms == 0).any():
+            continue
+        normalized = centered / norms
+        for i, bank in enumerate(sample.columns):
+            peers = normalized[:, np.arange(len(sample.columns)) != i]
+
+            def statistic(bank_returns, axis=-1):
+                correlations = np.moveaxis(bank_returns, axis, -1) @ peers
+                return np.stack((correlations.mean(axis=-1), np.median(correlations, axis=-1)), axis=-1)
+
+            result = permutation_test(
+                (normalized[:, i],), statistic, permutation_type="pairings", vectorized=True,
+                n_resamples=n_resamples, batch=256, alternative="two-sided", rng=rng,
+            )
+            means.loc[bank, year], medians.loc[bank, year] = result.pvalue
+    return (means.rename_axis(index="Bank", columns="Year"),
+            medians.rename_axis(index="Bank", columns="Year"))
 
 
 def main() -> None:
@@ -103,9 +150,22 @@ def main() -> None:
     portfolio_returns = equal_weight_portfolio_log_returns(returns_period)
     annual_returns = returns_full.loc[(returns_full.index >= annual_start) & (returns_full.index < annual_end)]
     annual_mean, annual_median = annual_bank_correlations(annual_returns)
+    print("Testing annual mean and median correlations (9,999 permutations per bank/year)...")
+    annual_mean_pvalues, annual_median_pvalues = annual_summary_correlation_pvalues(annual_returns)
 
     # Matrix from the reporting sample, excluding the pre-period buffer.
     correlation = returns_period.corr(method="pearson").loc[TICKERS, TICKERS]
+    correlation_pvalues = pearson_correlation_pvalues(correlation, len(returns_period))
+    correlation_pvalues = correlation_pvalues.mask(np.eye(len(TICKERS), dtype=bool))
+
+    annual_pair_pvalues = {}
+    for year, sample in annual_returns.groupby(annual_returns.index.year):
+        pvalues = pearson_correlation_pvalues(sample.corr(method="pearson"), len(sample))
+        annual_pair_pvalues[year] = {
+            f"{row}__{col}": pvalues.loc[row, col]
+            for i, row in enumerate(TICKERS) for col in TICKERS[i + 1:]
+        }
+    annual_pair_pvalues = pd.DataFrame(annual_pair_pvalues).rename_axis(index="Bank pair", columns="Year")
 
     # Rolling Pearson correlation using the past 90 trading-day returns.
     # Keep the full 10x10 matrix, including the redundant lower triangle and diagonal.
@@ -114,20 +174,33 @@ def main() -> None:
         for col in TICKERS:
             rolling[f"{row}__{col}"] = returns_full[row].rolling(WINDOW, min_periods=WINDOW).corr(returns_full[col])
     rolling = rolling.loc[rolling.index >= report_start].clip(lower=-1, upper=1)
+    rolling_pvalues = pearson_correlation_pvalues(rolling, WINDOW)
+    rolling_pvalues[[f"{ticker}__{ticker}" for ticker in TICKERS]] = np.nan
 
     prices_period.to_csv(OUTDIR / "adjusted_daily_prices.csv", float_format="%.8f")
     returns_period.to_csv(OUTDIR / "daily_log_returns.csv", float_format="%.10f")
     correlation.to_csv(OUTDIR / "full_period_correlation_matrix.csv", float_format="%.6f")
+    correlation_pvalues.to_csv(OUTDIR / "full_period_correlation_pvalues.csv", float_format="%.6e", na_rep="N/A")
+    annual_pair_pvalues.to_csv(OUTDIR / "annual_pairwise_correlation_pvalues.csv", float_format="%.6e", na_rep="N/A")
     rolling.to_csv(OUTDIR / "rolling_90day_correlations.csv", float_format="%.6f")
+    rolling_pvalues.to_csv(OUTDIR / "rolling_90day_correlation_pvalues.csv", float_format="%.6e", na_rep="N/A")
     annual_mean.to_csv(OUTDIR / "annual_mean_bank_correlations.csv", float_format="%.6f", na_rep="N/A")
     annual_median.to_csv(OUTDIR / "annual_median_bank_correlations.csv", float_format="%.6f", na_rep="N/A")
+    annual_mean_pvalues.to_csv(OUTDIR / "annual_mean_correlation_pvalues.csv", float_format="%.6e", na_rep="N/A")
+    annual_median_pvalues.to_csv(OUTDIR / "annual_median_correlation_pvalues.csv", float_format="%.6e", na_rep="N/A")
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(12, 1.25 * len(annual_mean.columns) + 2), 10))
-    for ax, table_data, statistic in zip(axes, [annual_mean, annual_median], ["Mean", "Median"]):
+    fig, axes = plt.subplots(4, 1, figsize=(max(12, 1.25 * len(annual_mean.columns) + 2), 20))
+    panels = [
+        (annual_mean, "Mean Pearson correlation with the other nine banks", ".3f"),
+        (annual_median, "Median Pearson correlation with the other nine banks", ".3f"),
+        (annual_mean_pvalues, "Permutation p-value for the mean correlation", ".2e"),
+        (annual_median_pvalues, "Permutation p-value for the median correlation", ".2e"),
+    ]
+    for ax, (table_data, title, number_format) in zip(axes, panels):
         ax.axis("off")
-        ax.set_title(f"{statistic} Pearson correlation with the other nine banks", pad=12)
+        ax.set_title(title, pad=12)
         table = ax.table(
-            cellText=table_data.map(lambda value: "N/A" if pd.isna(value) else f"{value:.3f}").to_numpy(),
+            cellText=table_data.map(lambda value: "N/A" if pd.isna(value) else format(value, number_format)).to_numpy(),
             rowLabels=table_data.index,
             colLabels=table_data.columns.astype(str),
             cellLoc="center", rowLoc="center", loc="center", bbox=[0.07, 0, 0.93, 0.95],
@@ -144,8 +217,10 @@ def main() -> None:
                 if col == -1:
                     cell.set_text_props(weight="bold")
     fig.suptitle(f"Annual bank correlations: {annual_start.year}\N{EN DASH}{annual_end.year - 1}", fontsize=17)
-    fig.text(0.5, 0.02, "Complete calendar years; correlations calculated from each year's daily log returns.\n"
-             "Each cell summarizes nine pairwise correlations; self-correlation excluded.", ha="center", fontsize=10)
+    fig.text(0.5, 0.02, "Complete calendar years; each summary excludes self-correlation.\n"
+             "Two-sided permutation tests: shuffle each bank's days against its fixed peers; assumes exchangeable trading days.\n"
+             "9,999 permutations (seed 0); smallest reported randomized p = 2.00e-04. Unadjusted for multiple comparisons.",
+             ha="center", fontsize=10)
     fig.tight_layout(rect=(0.02, 0.07, 0.98, 0.96), h_pad=3)
     fig.savefig(OUTDIR / "annual_bank_correlation_tables.png", dpi=200)
     plt.close(fig)
@@ -214,6 +289,8 @@ def main() -> None:
 
     print(f"\nReturn correlation matrix since {report_start.date()}:")
     print(correlation.round(3).to_string())
+    print("\nFull-period Pearson p-values (two-sided, unadjusted):")
+    print(correlation_pvalues.to_string(float_format=lambda value: f"{value:.3e}", na_rep="N/A"))
     print("\nAnnual mean correlations with the other nine banks (complete calendar years):")
     print(annual_mean.round(3).to_string())
     print("\nAnnual median correlations with the other nine banks (complete calendar years):")
